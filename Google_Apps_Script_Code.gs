@@ -1,0 +1,524 @@
+// ============================================================
+//  منظومة الصيانة — كلية العلوم — جامعة طنطا
+//  Google Apps Script — Backend API
+//  الإصدار: 2.0  |  وحدة تكنولوجيا المعلومات
+// ============================================================
+//
+//  ⚠️  قبل النشر: عدّل القيم في قسم CONFIGURATION أدناه
+//
+// ============================================================
+
+// ===== CONFIGURATION — عدّل هنا فقط =====
+
+const CONFIG = {
+  // معرّف Google Spreadsheet (من رابط الشيت)
+  SPREADSHEET_ID: 'ضع_ID_الشيت_هنا',
+
+  // أسماء الأوراق (Sheets) — لا تغيّرها إلا لو غيّرتها في الشيت
+  SHEET_REQUESTS:   'Requests',
+  SHEET_REPORTS:    'Reports',
+  SHEET_SPARES:     'SpareParts',
+
+  // إيميل مسؤول الصيانة (يتلقى إشعار بكل طلب جديد)
+  ADMIN_EMAIL: 'maintenance@science.tanta.edu.eg',
+
+  // اسم المسؤول (يظهر في الإيميل)
+  ADMIN_NAME: 'مسؤول الصيانة',
+
+  // اسم الكلية (يظهر في الإيميلات)
+  COLLEGE_NAME: 'كلية العلوم — جامعة طنطا',
+
+  // هل تفعّل إرسال إيميل للمستخدم تأكيداً؟
+  SEND_CONFIRM_EMAIL_TO_USER: true,
+};
+
+// ===== نهاية CONFIGURATION =====
+
+
+// ============================================================
+//  doGet — معالجة طلبات القراءة
+// ============================================================
+function doGet(e) {
+  const params = e.parameter;
+  let result;
+
+  try {
+    switch (params.action) {
+
+      case 'getRequests':
+        result = getRequests(params);
+        break;
+
+      case 'getTechRequests':
+        result = getTechRequests(params.techName);
+        break;
+
+      default:
+        result = { success: false, msg: 'Unknown action' };
+    }
+  } catch (err) {
+    result = { success: false, msg: err.toString() };
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+// ============================================================
+//  doPost — معالجة طلبات الكتابة
+// ============================================================
+function doPost(e) {
+  let payload;
+  let result;
+
+  try {
+    payload = JSON.parse(e.postData.contents);
+
+    switch (payload.action) {
+
+      case 'submitRequest':
+        result = submitRequest(payload);
+        break;
+
+      case 'updateStatus':
+        result = updateStatus(payload);
+        break;
+
+      case 'submitReport':
+        result = submitReport(payload);
+        break;
+
+      case 'submitSpare':
+        result = submitSpare(payload);
+        break;
+
+      default:
+        result = { success: false, msg: 'Unknown action' };
+    }
+  } catch (err) {
+    result = { success: false, msg: err.toString() };
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+// ============================================================
+//  submitRequest — تسجيل طلب صيانة جديد
+// ============================================================
+function submitRequest(data) {
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_REQUESTS);
+
+  // توليد رقم تذكرة فريد
+  const lastRow  = sheet.getLastRow();
+  const ticketNum = lastRow; // الصف 1 = header، فأول طلب = TU-0001
+  const ticketId  = 'TU-' + String(ticketNum).padStart(4, '0');
+
+  const now     = new Date();
+  const dateStr = Utilities.formatDate(now, 'Africa/Cairo', 'yyyy-MM-dd HH:mm:ss');
+
+  // الصفوف: [ticketId, date, name, phone, email, role, dept, location, category, subtype, priority, desc, status, assignedTech, techNotes, partsUsed, partsNeeded, followup, closedDate]
+  sheet.appendRow([
+    ticketId,
+    dateStr,
+    data.name    || '',
+    data.phone   || '',
+    data.email   || '',
+    data.role    || '',
+    data.dept    || '',
+    data.location || '',
+    data.category || '',
+    data.subtype  || '',
+    data.priority || 'medium',
+    data.desc    || '',
+    'جديد',     // status
+    '',          // assignedTech
+    '',          // techNotes
+    '',          // partsUsed
+    '',          // partsNeeded
+    '',          // followup
+    '',          // closedDate
+  ]);
+
+  // إرسال إيميل للمدير
+  sendAdminNotification(ticketId, data);
+
+  // إرسال تأكيد للمستخدم
+  if (CONFIG.SEND_CONFIRM_EMAIL_TO_USER && data.email) {
+    sendUserConfirmation(ticketId, data);
+  }
+
+  return { success: true, ticketId };
+}
+
+
+// ============================================================
+//  getRequests — جلب جميع الطلبات
+// ============================================================
+function getRequests(params) {
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_REQUESTS);
+
+  if (sheet.getLastRow() < 2) return { success: true, data: [] };
+
+  const rows   = sheet.getDataRange().getValues();
+  const header = rows[0];
+  const data   = rows.slice(1).map(row => rowToObj(header, row));
+
+  // فلتر حسب الفئة لو اتبعت
+  const categoryFilter = params && params.category;
+  const filtered = categoryFilter
+    ? data.filter(r => r.category === categoryFilter)
+    : data;
+
+  return { success: true, data: filtered };
+}
+
+
+// ============================================================
+//  getTechRequests — جلب مهام فني معين
+// ============================================================
+function getTechRequests(techName) {
+  if (!techName) return { success: false, msg: 'techName required' };
+
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_REQUESTS);
+
+  if (sheet.getLastRow() < 2) return { success: true, data: [] };
+
+  const rows   = sheet.getDataRange().getValues();
+  const header = rows[0];
+  const data   = rows.slice(1)
+    .map(row => rowToObj(header, row))
+    .filter(r => r.assignedTech === techName && r.status !== 'مكتمل' && r.status !== 'ملغي');
+
+  return { success: true, data };
+}
+
+
+// ============================================================
+//  updateStatus — تحديث حالة طلب (تكليف فني / قبول مهمة)
+// ============================================================
+function updateStatus(data) {
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_REQUESTS);
+
+  const rows   = sheet.getDataRange().getValues();
+  const header = rows[0];
+
+  const colStatus  = header.indexOf('status')  + 1;
+  const colTech    = header.indexOf('assignedTech') + 1;
+  const colTicket  = header.indexOf('ticketId') + 1;
+
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][colTicket - 1] === data.ticketId) {
+      if (colStatus  > 0) sheet.getRange(i + 1, colStatus).setValue(data.status);
+      if (colTech    > 0 && data.assignedTech) sheet.getRange(i + 1, colTech).setValue(data.assignedTech);
+
+      // إشعار المستخدم بالتكليف
+      const rowObj = rowToObj(header, rows[i]);
+      if (data.status === 'في الانتظار' && rowObj.email) {
+        sendStatusUpdateEmail(rowObj, data.status, data.assignedTech || '');
+      }
+
+      return { success: true };
+    }
+  }
+
+  return { success: false, msg: 'Ticket not found' };
+}
+
+
+// ============================================================
+//  submitReport — إغلاق طلب وحفظ تقرير الفني
+// ============================================================
+function submitReport(data) {
+  const ss           = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheetReq     = ss.getSheetByName(CONFIG.SHEET_REQUESTS);
+  const sheetReports = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+
+  const rows   = sheetReq.getDataRange().getValues();
+  const header = rows[0];
+
+  const colStatus      = header.indexOf('status')      + 1;
+  const colTechNotes   = header.indexOf('techNotes')   + 1;
+  const colPartsUsed   = header.indexOf('partsUsed')   + 1;
+  const colPartsNeeded = header.indexOf('partsNeeded') + 1;
+  const colFollowup    = header.indexOf('followup')    + 1;
+  const colClosedDate  = header.indexOf('closedDate')  + 1;
+  const colTicket      = header.indexOf('ticketId')    + 1;
+
+  const now     = new Date();
+  const dateStr = Utilities.formatDate(now, 'Africa/Cairo', 'yyyy-MM-dd HH:mm:ss');
+
+  let found = false;
+  let rowObj = {};
+
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][colTicket - 1] === data.ticketId) {
+      found = true;
+      rowObj = rowToObj(header, rows[i]);
+
+      if (colStatus      > 0) sheetReq.getRange(i + 1, colStatus).setValue('مكتمل');
+      if (colTechNotes   > 0) sheetReq.getRange(i + 1, colTechNotes).setValue(data.techNotes   || '');
+      if (colPartsUsed   > 0) sheetReq.getRange(i + 1, colPartsUsed).setValue(data.partsUsed   || '');
+      if (colPartsNeeded > 0) sheetReq.getRange(i + 1, colPartsNeeded).setValue(data.partsNeeded || '');
+      if (colFollowup    > 0) sheetReq.getRange(i + 1, colFollowup).setValue(data.followup     || 'لا');
+      if (colClosedDate  > 0) sheetReq.getRange(i + 1, colClosedDate).setValue(dateStr);
+      break;
+    }
+  }
+
+  if (!found) return { success: false, msg: 'Ticket not found' };
+
+  // حفظ تقرير في ورقة Reports
+  sheetReports.appendRow([
+    data.ticketId,
+    dateStr,
+    data.techName    || '',
+    data.techNotes   || '',
+    data.partsUsed   || '',
+    data.partsNeeded || '',
+    data.followup    || 'لا',
+    rowObj.category  || '',
+    rowObj.location  || '',
+  ]);
+
+  // إشعار المستخدم بإتمام الصيانة
+  if (rowObj.email) {
+    sendClosureEmail(rowObj, data);
+  }
+
+  return { success: true };
+}
+
+
+// ============================================================
+//  submitSpare — طلب قطع غيار من الفني
+// ============================================================
+function submitSpare(data) {
+  const ss    = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_SPARES);
+
+  const now     = new Date();
+  const dateStr = Utilities.formatDate(now, 'Africa/Cairo', 'yyyy-MM-dd HH:mm:ss');
+  const spareId = 'SP-' + String(sheet.getLastRow()).padStart(3, '0');
+
+  sheet.appendRow([
+    spareId,
+    dateStr,
+    data.ticketId  || '',
+    data.techName  || '',
+    data.partName  || '',
+    data.quantity  || 1,
+    data.purpose   || '',
+    'معلق',        // status
+  ]);
+
+  // إيميل للمدير عن طلب قطعة الغيار
+  MailApp.sendEmail({
+    to: CONFIG.ADMIN_EMAIL,
+    subject: `📦 طلب قطعة غيار جديد — ${spareId} | ${CONFIG.COLLEGE_NAME}`,
+    htmlBody: `
+      <div dir="rtl" style="font-family:Arial;padding:20px">
+        <h2>📦 طلب قطعة غيار</h2>
+        <p><b>رقم الطلب:</b> ${spareId}</p>
+        <p><b>مرتبط بالطلب:</b> ${data.ticketId || '—'}</p>
+        <p><b>الفني:</b> ${data.techName || '—'}</p>
+        <p><b>القطعة:</b> ${data.partName || '—'}</p>
+        <p><b>الكمية:</b> ${data.quantity || 1}</p>
+        <p><b>الغرض:</b> ${data.purpose || '—'}</p>
+        <hr>
+        <p style="color:#666;font-size:12px">${CONFIG.COLLEGE_NAME}</p>
+      </div>
+    `
+  });
+
+  return { success: true, spareId };
+}
+
+
+// ============================================================
+//  دوال الإيميل
+// ============================================================
+
+function sendAdminNotification(ticketId, data) {
+  const priorityColors = { urgent: '#b91c1c', high: '#b45309', medium: '#0369a1', low: '#0d7a4e' };
+  const color = priorityColors[data.priority] || '#0369a1';
+
+  MailApp.sendEmail({
+    to: CONFIG.ADMIN_EMAIL,
+    subject: `🔧 طلب صيانة جديد #${ticketId} | ${data.category} | ${CONFIG.COLLEGE_NAME}`,
+    htmlBody: `
+      <div dir="rtl" style="font-family:Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">
+        <div style="background:#1a3a6b;padding:20px 24px;color:#fff">
+          <h2 style="margin:0;font-size:20px">🔧 طلب صيانة جديد</h2>
+          <p style="margin:4px 0 0;opacity:0.8;font-size:13px">${CONFIG.COLLEGE_NAME}</p>
+        </div>
+        <div style="padding:24px">
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <tr><td style="padding:8px;color:#64748b;width:40%">رقم الطلب</td><td style="padding:8px;font-weight:700;color:#1a3a6b">#${ticketId}</td></tr>
+            <tr style="background:#f8fafc"><td style="padding:8px;color:#64748b">نوع الصيانة</td><td style="padding:8px">${data.category} — ${data.subtype || ''}</td></tr>
+            <tr><td style="padding:8px;color:#64748b">الموقع</td><td style="padding:8px">${data.location}</td></tr>
+            <tr style="background:#f8fafc"><td style="padding:8px;color:#64748b">الأولوية</td><td style="padding:8px"><span style="background:${color};color:#fff;padding:2px 10px;border-radius:20px;font-size:12px">${priorityAr(data.priority)}</span></td></tr>
+            <tr><td style="padding:8px;color:#64748b">المقدم</td><td style="padding:8px">${data.name}</td></tr>
+            <tr style="background:#f8fafc"><td style="padding:8px;color:#64748b">الوظيفة</td><td style="padding:8px">${data.role} — ${data.dept}</td></tr>
+            <tr><td style="padding:8px;color:#64748b">التليفون</td><td style="padding:8px" dir="ltr">${data.phone}</td></tr>
+            <tr style="background:#f8fafc"><td style="padding:8px;color:#64748b">الوصف</td><td style="padding:8px">${data.desc}</td></tr>
+          </table>
+        </div>
+        <div style="background:#f1f5f9;padding:14px 24px;font-size:12px;color:#94a3b8;text-align:center">
+          منظومة الصيانة الإلكترونية — ${CONFIG.COLLEGE_NAME}
+        </div>
+      </div>
+    `
+  });
+}
+
+function sendUserConfirmation(ticketId, data) {
+  MailApp.sendEmail({
+    to: data.email,
+    subject: `✅ تأكيد استلام طلب الصيانة #${ticketId} | ${CONFIG.COLLEGE_NAME}`,
+    htmlBody: `
+      <div dir="rtl" style="font-family:Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">
+        <div style="background:#1a3a6b;padding:20px 24px;color:#fff">
+          <h2 style="margin:0;font-size:20px">✅ تم استلام طلبك</h2>
+          <p style="margin:4px 0 0;opacity:0.8;font-size:13px">${CONFIG.COLLEGE_NAME}</p>
+        </div>
+        <div style="padding:24px">
+          <p>عزيزي / <b>${data.name}</b>،</p>
+          <p>تم استلام طلب الصيانة الخاص بك بنجاح. فيما يلي تفاصيل طلبك:</p>
+          <div style="background:#f8fafc;border-right:4px solid #1a3a6b;padding:16px;border-radius:8px;margin:16px 0">
+            <p style="margin:4px 0"><b>رقم الطلب:</b> <span style="color:#1a3a6b;font-weight:700">#${ticketId}</span></p>
+            <p style="margin:4px 0"><b>نوع الصيانة:</b> ${data.category}</p>
+            <p style="margin:4px 0"><b>الموقع:</b> ${data.location}</p>
+            <p style="margin:4px 0"><b>الأولوية:</b> ${priorityAr(data.priority)}</p>
+          </div>
+          <p>سيتم التواصل معك عند تكليف الفني المختص. يمكنك متابعة حالة طلبك من خلال النظام.</p>
+          <p style="color:#64748b;font-size:13px">شكراً لاستخدامك منظومة الصيانة الإلكترونية.</p>
+        </div>
+        <div style="background:#f1f5f9;padding:14px 24px;font-size:12px;color:#94a3b8;text-align:center">
+          منظومة الصيانة الإلكترونية — ${CONFIG.COLLEGE_NAME}
+        </div>
+      </div>
+    `
+  });
+}
+
+function sendStatusUpdateEmail(rowObj, status, techName) {
+  if (!rowObj.email) return;
+
+  MailApp.sendEmail({
+    to: rowObj.email,
+    subject: `🔄 تحديث حالة طلبك #${rowObj.ticketId} | ${CONFIG.COLLEGE_NAME}`,
+    htmlBody: `
+      <div dir="rtl" style="font-family:Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">
+        <div style="background:#1a3a6b;padding:20px 24px;color:#fff">
+          <h2 style="margin:0;font-size:20px">🔄 تحديث على طلبك</h2>
+          <p style="margin:4px 0 0;opacity:0.8;font-size:13px">${CONFIG.COLLEGE_NAME}</p>
+        </div>
+        <div style="padding:24px">
+          <p>عزيزي / <b>${rowObj.name || ''}</b>،</p>
+          <p>نحيطك علماً بأن حالة طلب الصيانة رقم <b>#${rowObj.ticketId}</b> قد تم تحديثها:</p>
+          <div style="background:#f8fafc;border-right:4px solid #c8930a;padding:16px;border-radius:8px;margin:16px 0">
+            <p style="margin:4px 0"><b>الحالة الجديدة:</b> <span style="color:#c8930a;font-weight:700">${status}</span></p>
+            ${techName ? `<p style="margin:4px 0"><b>الفني المكلف:</b> ${techName}</p>` : ''}
+          </div>
+        </div>
+        <div style="background:#f1f5f9;padding:14px 24px;font-size:12px;color:#94a3b8;text-align:center">
+          منظومة الصيانة الإلكترونية — ${CONFIG.COLLEGE_NAME}
+        </div>
+      </div>
+    `
+  });
+}
+
+function sendClosureEmail(rowObj, reportData) {
+  MailApp.sendEmail({
+    to: rowObj.email,
+    subject: `✅ تم إتمام صيانة طلبك #${rowObj.ticketId} | ${CONFIG.COLLEGE_NAME}`,
+    htmlBody: `
+      <div dir="rtl" style="font-family:Arial,sans-serif;max-width:600px;margin:auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden">
+        <div style="background:#0d7a4e;padding:20px 24px;color:#fff">
+          <h2 style="margin:0;font-size:20px">✅ تم إتمام الصيانة</h2>
+          <p style="margin:4px 0 0;opacity:0.8;font-size:13px">${CONFIG.COLLEGE_NAME}</p>
+        </div>
+        <div style="padding:24px">
+          <p>عزيزي / <b>${rowObj.name || ''}</b>،</p>
+          <p>يسعدنا إبلاغك بأن طلب الصيانة رقم <b>#${rowObj.ticketId}</b> قد تم إغلاقه بنجاح.</p>
+          <div style="background:#f0fdf4;border-right:4px solid #0d7a4e;padding:16px;border-radius:8px;margin:16px 0">
+            <p style="margin:4px 0"><b>الفني:</b> ${reportData.techName || '—'}</p>
+            <p style="margin:4px 0"><b>العمل المنجز:</b> ${reportData.techNotes || '—'}</p>
+            ${reportData.followup === 'نعم' ? '<p style="margin:4px 0;color:#b45309"><b>⚠️ ملاحظة:</b> يستلزم الأمر زيارة متابعة لاحقاً.</p>' : ''}
+          </div>
+          <p style="color:#64748b;font-size:13px">نأمل أن تكون الخدمة قد لبّت توقعاتك. شكراً.</p>
+        </div>
+        <div style="background:#f1f5f9;padding:14px 24px;font-size:12px;color:#94a3b8;text-align:center">
+          منظومة الصيانة الإلكترونية — ${CONFIG.COLLEGE_NAME}
+        </div>
+      </div>
+    `
+  });
+}
+
+
+// ============================================================
+//  دوال مساعدة
+// ============================================================
+
+function rowToObj(header, row) {
+  const obj = {};
+  header.forEach((key, i) => { obj[key] = row[i]; });
+  return obj;
+}
+
+function priorityAr(p) {
+  const m = { urgent: '🔴 عاجل جداً', high: '🟠 عالي', medium: '🟡 متوسط', low: '🟢 منخفض' };
+  return m[p] || p;
+}
+
+
+// ============================================================
+//  إعداد هيكل الشيت تلقائياً (شغّلها مرة واحدة فقط)
+// ============================================================
+function setupSheets() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+
+  // ورقة Requests
+  let sheetReq = ss.getSheetByName(CONFIG.SHEET_REQUESTS);
+  if (!sheetReq) sheetReq = ss.insertSheet(CONFIG.SHEET_REQUESTS);
+  if (sheetReq.getLastRow() === 0) {
+    sheetReq.appendRow([
+      'ticketId','date','name','phone','email','role','dept','location',
+      'category','subtype','priority','desc','status','assignedTech',
+      'techNotes','partsUsed','partsNeeded','followup','closedDate'
+    ]);
+    sheetReq.getRange(1, 1, 1, 19).setBackground('#1a3a6b').setFontColor('#ffffff').setFontWeight('bold');
+    sheetReq.setFrozenRows(1);
+  }
+
+  // ورقة Reports
+  let sheetRep = ss.getSheetByName(CONFIG.SHEET_REPORTS);
+  if (!sheetRep) sheetRep = ss.insertSheet(CONFIG.SHEET_REPORTS);
+  if (sheetRep.getLastRow() === 0) {
+    sheetRep.appendRow(['ticketId','closedDate','techName','techNotes','partsUsed','partsNeeded','followup','category','location']);
+    sheetRep.getRange(1, 1, 1, 9).setBackground('#0d7a4e').setFontColor('#ffffff').setFontWeight('bold');
+    sheetRep.setFrozenRows(1);
+  }
+
+  // ورقة SpareParts
+  let sheetSp = ss.getSheetByName(CONFIG.SHEET_SPARES);
+  if (!sheetSp) sheetSp = ss.insertSheet(CONFIG.SHEET_SPARES);
+  if (sheetSp.getLastRow() === 0) {
+    sheetSp.appendRow(['spareId','date','ticketId','techName','partName','quantity','purpose','status']);
+    sheetSp.getRange(1, 1, 1, 8).setBackground('#c8930a').setFontColor('#ffffff').setFontWeight('bold');
+    sheetSp.setFrozenRows(1);
+  }
+
+  Logger.log('✅ تم إنشاء الأوراق بنجاح');
+}
